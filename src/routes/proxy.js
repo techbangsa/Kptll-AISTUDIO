@@ -14,13 +14,17 @@ const BEHAVIOR_TTL_S = 30 * 24 * 60 * 60;
 router.post('/behavior', async (req, res) => {
   const auth = verifyAppProxy(req.query);
   if (!auth) return res.status(401).json({ error: 'Invalid signature' });
-  if (!auth.customerId) return res.status(204).end();
+  // Guest (no storefront customer session): nothing to store.
+  if (!auth.customerId) return res.status(200).json({ stored: false, reason: 'guest' });
 
   try {
-    const key = `behavior:${auth.shop}:${auth.customerId}`;
+    // Customer ids are unique across Shopify, so the key doesn't depend on which shop domain
+    // the proxy or the session token reports.
+    const key = `behavior:${auth.customerId}`;
     const stored = await kv.get(key);
-    await kv.set(key, mergeBehavior(stored, sanitizeBehavior(req.body)), BEHAVIOR_TTL_S);
-    res.status(204).end();
+    const merged = mergeBehavior(stored, sanitizeBehavior(req.body));
+    await kv.set(key, { ...merged, shop: auth.shop || stored?.shop || '' }, BEHAVIOR_TTL_S);
+    res.status(200).json({ stored: true });
   } catch (error) {
     console.error('[proxy/behavior]', error);
     res.status(500).json({ error: 'Could not save behavior' });

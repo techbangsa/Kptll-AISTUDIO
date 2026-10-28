@@ -5,7 +5,7 @@ const MAX_CANDIDATES = 60;
 const TIMEOUT_MS = 5000;
 
 /**
- * @typedef {{ id: string, handle: string, title: string, vendor: string, type: string, price: number, tags: string[], found_via: string, unlisted: boolean }} Candidate
+ * @typedef {{ id: string, handle: string, title: string, vendor: string, type: string, price: number, compare_at: number, image: string, tags: string[], found_via: string, unlisted: boolean }} Candidate
  */
 
 /** @param {unknown} tags */
@@ -22,13 +22,26 @@ function normalizePrice(price) {
   return Number.parseFloat(String(price || '0')) || 0;
 }
 
+/** @param {any} product */
+function imageOf(product) {
+  const raw =
+    product.featured_image?.url ||
+    (typeof product.featured_image === 'string' ? product.featured_image : '') ||
+    product.image ||
+    product.images?.[0]?.src ||
+    (typeof product.images?.[0] === 'string' ? product.images[0] : '') ||
+    '';
+  return String(raw).replace(/^\/\//, 'https://');
+}
+
 /**
  * @param {any} product
  * @param {unknown} price
  * @param {string} foundVia
+ * @param {unknown} [compareAt]
  * @returns {Candidate}
  */
-function toCandidate(product, price, foundVia) {
+function toCandidate(product, price, foundVia, compareAt = product.compare_at_price) {
   const tags = tagList(product.tags);
   return {
     id: String(product.id),
@@ -37,6 +50,8 @@ function toCandidate(product, price, foundVia) {
     vendor: product.vendor || '',
     type: product.product_type || product.type || '',
     price: normalizePrice(price),
+    compare_at: normalizePrice(compareAt),
+    image: imageOf(product),
     tags: tags.slice(0, 5),
     found_via: foundVia,
     unlisted: tags.some((tag) => tag.toLowerCase() === 'unlisted'),
@@ -84,7 +99,7 @@ function storefront(shop) {
         .filter((/** @type {any} */ p) => p.variants?.some((/** @type {any} */ v) => v.available))
         .map((/** @type {any} */ p) => {
           const variant = p.variants.find((/** @type {any} */ v) => v.available) || p.variants[0];
-          return toCandidate(p, variant?.price, `collection "${title || handle}"`);
+          return toCandidate(p, variant?.price, `collection "${title || handle}"`, variant?.compare_at_price);
         });
     },
 

@@ -68,14 +68,26 @@ router.post('/recommendations', async (req, res) => {
   const locale = str(req.body?.locale, 10).toLowerCase().split('-')[0];
   const language = LANGUAGES[/** @type {keyof typeof LANGUAGES} */ (locale)] || 'English';
   const purchased = sanitizePurchased(req.body);
-  const customerKey = `${auth.shop}:${auth.customerId}`;
+  const customerId = auth.customerId;
 
   try {
-    const behavior = await kv.get(`behavior:${customerKey}`).catch(() => null);
+    const behavior =
+      (await kv.get(`behavior:${customerId}`).catch(() => null)) ||
+      // Keys written before they were shop independent.
+      (await kv.get(`behavior:${auth.shop}:${customerId}`).catch(() => null));
     const signals = topSignals(behavior, 5);
-    const hasSignals =
-      signals.searches.length + signals.collections.length + signals.products.length + purchased.length > 0;
-    if (!hasSignals) return res.json({ headline: '', subheading: '', items: [], ai: false });
+    // Fetch candidates from the shop the storefront proxy reported; the session token's `dest`
+    // is only a fallback.
+    const shop = behavior?.shop || process.env.SHOP_DOMAIN || auth.shop;
+    /** @type {Record<string, unknown>} */
+    const meta = {
+      behavior: Boolean(behavior),
+      signals: signals.searches.length + signals.collections.length + signals.products.length,
+      purchased: purchased.length,
+    };
+    if (!meta.signals && !purchased.length) {
+      return res.json({ headline: '', subheading: '', items: [], ai: false, meta });
+    }
 
     const signature = crypto
       .createHash('sha256')
@@ -92,11 +104,15 @@ router.post('/recommendations', async (req, res) => {
       )
       .digest('hex');
 
-    const cached = await kv.get(`reco:${customerKey}`).catch(() => null);
-    if (cached?.signature === signature) return res.json({ ...cached.result, cached: true });
+    const cached = await kv.get(`reco:${customerId}`).catch(() => null);
+    if (cached?.signature === signature) return res.json({ ...cached.result, cached: true, meta });
 
-    const candidates = await fetchCandidates(auth.shop, signals, purchased);
-    if (candidates.length === 0) return res.json({ headline: '', subheading: '', items: [], ai: false });
+    const candidates = await fetchCandidates(shop, signals, purchased);
+    meta.candidates = candidates.length;
+    if (candidates.length === 0) {
+      console.warn('[account/recommendations] no candidates', { shop, ...meta });
+      return res.json({ headline: '', subheading: '', items: [], ai: false, meta });
+    }
 
     const byId = new Map(candidates.map((c) => [c.id, c]));
     let result;
@@ -114,7 +130,15 @@ router.post('/recommendations', async (req, res) => {
           filters: signals.filters.map((f) => ({ filter: f.label, score: f.score })),
           purchased_products: purchased.map((p) => ({ title: p.title, type: p.type, vendor: p.vendor })),
         },
-        candidates: candidates.map(({ unlisted, handle, ...candidate }) => candidate),
+        candidates: candidates.map(({ id, title, vendor, type, price, tags, found_via }) => ({
+          id,
+          title,
+          vendor,
+          type,
+          price,
+          tags,
+          found_via,
+        })),
       });
       result = { headline: ai.headline, subheading: ai.subheading, items: ai.items, ai: true };
     } catch (error) {
@@ -128,16 +152,27 @@ router.post('/recommendations', async (req, res) => {
       if (result.items.length >= maxProducts) break;
       if (!used.has(candidate.id)) result.items.push({ id: candidate.id, reason: '' });
     }
-    result.items = result.items.map((/** @type {any} */ item) => ({
-      id: item.id,
-      handle: byId.get(item.id)?.handle || '',
-      reason: item.reason,
-    }));
+    // Display data travels with each item, so the extension can render even when a product is
+    // missing from its Storefront API response.
+    result.items = result.items.map((/** @type {any} */ item) => {
+      const candidate = byId.get(item.id);
+      return {
+        id: item.id,
+        handle: candidate?.handle || '',
+        reason: item.reason,
+        title: candidate?.title || '',
+        vendor: candidate?.vendor || '',
+        price: candidate?.price || 0,
+        compare_at: candidate?.compare_at || 0,
+        image: candidate?.image || '',
+        url: candidate?.handle ? `https://${shop}/products/${candidate.handle}` : '',
+      };
+    });
 
-    await kv.set(`reco:${customerKey}`, { signature, result }, RECO_TTL_S).catch((error) => {
+    await kv.set(`reco:${customerId}`, { signature, result }, RECO_TTL_S).catch((error) => {
       console.warn('[account/recommendations] cache write failed', error);
     });
-    res.json(result);
+    res.json({ ...result, meta });
   } catch (error) {
     console.error('[account/recommendations]', error);
     res.status(502).json({ error: 'Recommendation failed' });
