@@ -5,6 +5,8 @@ dotenv.config();
 
 const webhookRoutes = require('./routes/webhook');
 const recommendationRoutes = require('./routes/recommendations');
+const proxyRoutes = require('./routes/proxy');
+const accountRoutes = require('./routes/account');
 const { cors } = require('./lib/cors');
 
 const app = express();
@@ -22,6 +24,10 @@ app.get("/", (req, res) => {
 // Use the webhook routes
 app.use('/api/webhook', webhookRoutes);
 app.use('/api/recommendations', cors, recommendationRoutes);
+// Storefront → Shopify App Proxy (/apps/kptll-reco/*) → here. Signed by Shopify, no CORS needed.
+app.use('/api/proxy', proxyRoutes);
+// Customer account UI extension, authenticated with a bearer session token.
+app.use('/api/account', accountRoutes);
 
 // Vercel imports the exported app; only listen when run directly (npm run dev / start).
 if (require.main === module) {

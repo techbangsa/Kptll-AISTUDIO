@@ -1,8 +1,9 @@
 // Origins allowed to call the API. Add the live storefront domain via ALLOWED_ORIGINS
-// (comma separated), e.g. ALLOWED_ORIGINS=https://kapitall.co.id,https://www.kapitall.co.id
+// (comma separated), e.g. ALLOWED_ORIGINS=https://shop.example.com
 const DEFAULT_PATTERNS = [
   /^https:\/\/[a-z0-9-]+\.myshopify\.com$/,
   /^https:\/\/[a-z0-9-]+\.shopifypreview\.com$/,
+  /^https:\/\/(www\.)?kptll\.com$/,
   /^https:\/\/([a-z0-9-]+\.)*kapitall[a-z0-9-]*(\.[a-z]+)+$/,
   /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/,
 ];
