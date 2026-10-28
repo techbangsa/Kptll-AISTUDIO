@@ -107,8 +107,9 @@ router.post('/recommendations', async (req, res) => {
     const cached = await kv.get(`reco:${customerId}`).catch(() => null);
     if (cached?.signature === signature) return res.json({ ...cached.result, cached: true, meta });
 
-    const candidates = await fetchCandidates(shop, signals, purchased);
+    const { candidates, errors } = await fetchCandidates(shop, signals, purchased);
     meta.candidates = candidates.length;
+    if (errors.length) meta.errors = errors.slice(0, 3);
     if (candidates.length === 0) {
       console.warn('[account/recommendations] no candidates', { shop, ...meta });
       return res.json({ headline: '', subheading: '', items: [], ai: false, meta });
@@ -165,7 +166,7 @@ router.post('/recommendations', async (req, res) => {
         price: candidate?.price || 0,
         compare_at: candidate?.compare_at || 0,
         image: candidate?.image || '',
-        url: candidate?.handle ? `https://${shop}/products/${candidate.handle}` : '',
+        url: candidate?.url || (candidate?.handle ? `https://${shop}/products/${candidate.handle}` : ''),
       };
     });
 

@@ -1,60 +1,89 @@
 // Server-side port of the candidate collection in the theme's assets/ai-personalized-recommendations.js.
-// Uses the storefront's public JSON endpoints, so no API token is needed.
+// Uses the Storefront API (tokenless, or with SHOPIFY_STOREFRONT_TOKEN when set): unlike the
+// storefront's /search/suggest.json and /products.json endpoints, it isn't bot-blocked for
+// requests coming from server IPs such as Vercel's.
 
+const API_VERSION = '2026-10';
 const MAX_CANDIDATES = 60;
-const TIMEOUT_MS = 5000;
+const TIMEOUT_MS = 6000;
+
+const FIELDS = `fragment CandidateFields on Product {
+  id
+  handle
+  title
+  vendor
+  productType
+  tags
+  availableForSale
+  onlineStoreUrl
+  featuredImage {
+    url(transform: { maxWidth: 480, maxHeight: 480 })
+  }
+  priceRange {
+    minVariantPrice {
+      amount
+    }
+  }
+  compareAtPriceRange {
+    minVariantPrice {
+      amount
+    }
+  }
+}`;
+
+const SEARCH_QUERY = `${FIELDS}
+query CandidateSearch($query: String!) {
+  search(query: $query, first: 10, types: PRODUCT, unavailableProducts: HIDE) {
+    nodes {
+      ... on Product {
+        ...CandidateFields
+      }
+    }
+  }
+}`;
+
+const COLLECTION_QUERY = `${FIELDS}
+query CandidateCollection($handle: String!) {
+  collection(handle: $handle) {
+    products(first: 30) {
+      nodes {
+        ...CandidateFields
+      }
+    }
+  }
+}`;
+
+const RELATED_QUERY = `${FIELDS}
+query CandidateRelated($productId: ID!) {
+  productRecommendations(productId: $productId, intent: RELATED) {
+    ...CandidateFields
+  }
+}`;
 
 /**
- * @typedef {{ id: string, handle: string, title: string, vendor: string, type: string, price: number, compare_at: number, image: string, tags: string[], found_via: string, unlisted: boolean }} Candidate
+ * @typedef {{ id: string, handle: string, title: string, vendor: string, type: string, price: number, compare_at: number, image: string, url: string, tags: string[], found_via: string, unlisted: boolean }} Candidate
  */
 
-/** @param {unknown} tags */
-function tagList(tags) {
-  return (Array.isArray(tags) ? tags : String(tags || '').split(','))
-    .map((tag) => String(tag).trim())
-    .filter(Boolean);
-}
-
-/** @param {unknown} price */
-function normalizePrice(price) {
-  // Recommendations API returns cents as integers; products.json / suggest.json return strings in major units.
-  if (typeof price === 'number') return price / 100;
-  return Number.parseFloat(String(price || '0')) || 0;
-}
-
-/** @param {any} product */
-function imageOf(product) {
-  const raw =
-    product.featured_image?.url ||
-    (typeof product.featured_image === 'string' ? product.featured_image : '') ||
-    product.image ||
-    product.images?.[0]?.src ||
-    (typeof product.images?.[0] === 'string' ? product.images[0] : '') ||
-    '';
-  return String(raw).replace(/^\/\//, 'https://');
-}
-
 /**
- * @param {any} product
- * @param {unknown} price
+ * @param {any} product Storefront API product
  * @param {string} foundVia
- * @param {unknown} [compareAt]
  * @returns {Candidate}
  */
-function toCandidate(product, price, foundVia, compareAt = product.compare_at_price) {
-  const tags = tagList(product.tags);
+function toCandidate(product, foundVia) {
+  const tags = Array.isArray(product.tags) ? product.tags : [];
   return {
-    id: String(product.id),
+    id: String(product.id).split('/').pop() || '',
     handle: String(product.handle || ''),
     title: String(product.title || ''),
     vendor: product.vendor || '',
-    type: product.product_type || product.type || '',
-    price: normalizePrice(price),
-    compare_at: normalizePrice(compareAt),
-    image: imageOf(product),
+    type: product.productType || '',
+    price: Number(product.priceRange?.minVariantPrice?.amount) || 0,
+    compare_at: Number(product.compareAtPriceRange?.minVariantPrice?.amount) || 0,
+    image: product.featuredImage?.url || '',
+    url: product.onlineStoreUrl || '',
     tags: tags.slice(0, 5),
     found_via: foundVia,
-    unlisted: tags.some((tag) => tag.toLowerCase() === 'unlisted'),
+    unlisted: tags.some((/** @type {string} */ tag) => String(tag).toLowerCase() === 'unlisted'),
   };
 }
 
@@ -62,31 +91,42 @@ function toCandidate(product, price, foundVia, compareAt = product.compare_at_pr
  * @param {string} shop myshopify domain
  */
 function storefront(shop) {
-  const base = `https://${shop}`;
+  /**
+   * @param {string} query
+   * @param {Record<string, unknown>} variables
+   */
+  async function gql(query, variables) {
+    /** @type {Record<string, string>} */
+    const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+    if (process.env.SHOPIFY_STOREFRONT_TOKEN) {
+      headers['X-Shopify-Storefront-Access-Token'] = process.env.SHOPIFY_STOREFRONT_TOKEN;
+    }
 
-  /** @param {string} path */
-  async function json(path) {
-    const response = await fetch(`${base}${path}`, {
-      headers: { Accept: 'application/json' },
+    const response = await fetch(`https://${shop}/api/${API_VERSION}/graphql.json`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ query, variables }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
-    if (!response.ok) throw new Error(`${response.status} ${path}`);
-    return response.json();
+    if (!response.ok) throw new Error(`Storefront API ${response.status}: ${(await response.text()).slice(0, 120)}`);
+
+    const json = await response.json();
+    if (json.errors?.length) throw new Error(`Storefront API: ${json.errors[0].message}`);
+    return json.data;
   }
+
+  /**
+   * @param {any[] | undefined} products
+   * @param {string} foundVia
+   */
+  const available = (products, foundVia) =>
+    (products || []).filter((p) => p?.availableForSale).map((p) => toCandidate(p, foundVia));
 
   return {
     /** @param {string} term */
     async search(term) {
-      const params = new URLSearchParams({
-        q: term,
-        'resources[type]': 'product',
-        'resources[limit]': '10',
-        'resources[options][unavailable_products]': 'hide',
-      });
-      const data = await json(`/search/suggest.json?${params}`);
-      return (data?.resources?.results?.products || [])
-        .filter((/** @type {any} */ p) => p.available !== false)
-        .map((/** @type {any} */ p) => toCandidate(p, p.price, `search "${term}"`));
+      const data = await gql(SEARCH_QUERY, { query: term });
+      return available(data?.search?.nodes, `search "${term}"`);
     },
 
     /**
@@ -94,25 +134,17 @@ function storefront(shop) {
      * @param {string} title
      */
     async collection(handle, title) {
-      const data = await json(`/collections/${encodeURIComponent(handle)}/products.json?limit=30`);
-      return (data?.products || [])
-        .filter((/** @type {any} */ p) => p.variants?.some((/** @type {any} */ v) => v.available))
-        .map((/** @type {any} */ p) => {
-          const variant = p.variants.find((/** @type {any} */ v) => v.available) || p.variants[0];
-          return toCandidate(p, variant?.price, `collection "${title || handle}"`, variant?.compare_at_price);
-        });
+      const data = await gql(COLLECTION_QUERY, { handle });
+      return available(data?.collection?.products?.nodes, `collection "${title || handle}"`);
     },
 
     /**
-     * @param {string} productId
+     * @param {string} productId numeric id
      * @param {string} label
      */
     async related(productId, label) {
-      const params = new URLSearchParams({ product_id: productId, limit: '8', intent: 'related' });
-      const data = await json(`/recommendations/products.json?${params}`);
-      return (data?.products || [])
-        .filter((/** @type {any} */ p) => p.available !== false)
-        .map((/** @type {any} */ p) => toCandidate(p, p.price, label));
+      const data = await gql(RELATED_QUERY, { productId: `gid://shopify/Product/${productId}` });
+      return available(data?.productRecommendations, label).slice(0, 8);
     },
   };
 }
@@ -121,7 +153,7 @@ function storefront(shop) {
  * @param {string} shop
  * @param {ReturnType<typeof import('./signals').topSignals>} signals
  * @param {{ id: string, title: string }[]} purchased
- * @returns {Promise<Candidate[]>}
+ * @returns {Promise<{ candidates: Candidate[], errors: string[] }>}
  */
 async function fetchCandidates(shop, signals, purchased) {
   const api = storefront(shop);
@@ -141,24 +173,27 @@ async function fetchCandidates(shop, signals, purchased) {
 
   const results = await Promise.allSettled(requests);
   const seen = new Set([...signals.products.map((p) => p.id), ...purchased.map((p) => p.id)]);
+  /** @type {string[]} */
+  const errors = [];
 
   /** @type {Map<string, Candidate>} */
   const unique = new Map();
   for (const result of results) {
     if (result.status !== 'fulfilled') {
-      console.warn('[candidates]', result.reason?.message || result.reason);
+      errors.push(String(result.reason?.message || result.reason).slice(0, 160));
       continue;
     }
     for (const candidate of result.value) {
       if (!candidate.unlisted && !unique.has(candidate.id)) unique.set(candidate.id, candidate);
     }
   }
+  if (errors.length) console.warn('[candidates]', shop, errors);
 
   // Prefer products the customer has not viewed or bought yet, but keep those as backup.
   const list = [...unique.values()];
   const fresh = list.filter((c) => !seen.has(c.id));
   const known = list.filter((c) => seen.has(c.id));
-  return [...fresh, ...known].slice(0, MAX_CANDIDATES);
+  return { candidates: [...fresh, ...known].slice(0, MAX_CANDIDATES), errors };
 }
 
 module.exports = { fetchCandidates };
